@@ -337,7 +337,7 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
                     "anno_id": anno_id,
                 }
             # <<<--- ADD SD FEATURES TO META DICTIONARY ---
-            meta['sd_features'] = sd_features
+            meta['sd_feature'] = sd_feature
             return meta
         else:
             img_id, anno_id, category_id = self.label_info[index].split("_")
@@ -467,7 +467,7 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
                     "anno_id": anno_id,
                 }
             # <<<--- ADD SD FEATURES TO META DICTIONARY ---
-            meta['sd_features'] = sd_features
+            meta['sd_feature'] = sd_feature
             return meta
     def data_augmentation(self, mask):
         mask = mask.astype(np.float)
@@ -507,7 +507,13 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
                 if b[k] is not None:
                     temp_.append(b[k])
             if len(temp_) > 0:
-                res[k] = default_collate(temp_)
+                # --- 修正: 单独处理 'sd_feature' ---
+                if k == 'sd_feature':
+                    # 将单个张量堆叠成一个批次
+                    res[k] = torch.stack(temp_)
+                else:
+                    res[k] = default_collate(temp_)
+                # --- 修正结束 ---
             else:
                 res[k] = None
 

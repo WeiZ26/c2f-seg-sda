@@ -127,30 +127,15 @@ class C2F_Seg(nn.Module):
         z_loss = 0
 
         # --- Start of Modification ---
-        # 1. Retrieve pre-loaded SD features from the meta dictionary
-        sd_features = meta['sd_features']
-        with torch.no_grad(): # 确保 ResNet 冻结
-            # Dataloader 提供的 img_crop 是 [B, H, W, 3], ResNet 需要 [B, 3, H, W]
+        # 1. Get the single, deepest SD feature for the Transformer
+        #    It was loaded as 'sd_feature' (singular) in the dataloader
+        deepest_ft = meta['sd_feature'].to(self.config.device) # [B, C, H, W]
+
+        # 2. Get ResNet features (which are frozen) for the Refine Module
+        with torch.no_grad(): 
             img_crop_bchw = meta['img_crop'].permute((0, 3, 1, 2)).to(torch.float32)
             resnet_features = self.img_encoder(img_crop_bchw)
-        # 2. Move features to the correct GPU device
-        sd_features = [f.to(self.config.device) for f in sd_features]
-
-        # 3. The features are loaded from index 0 (deepest) to 3 (shallowest).
-        #    We reverse the list to match C2F-Seg's expectation of shallow-to-deep.
-        sd_features.reverse()  # Now, sd_features[0] is the shallowest, sd_features[3] is the deepest.
-
-        # 4. Prepare the deepest feature for the MaskedTransformer, resizing to 16x16
-        deepest_ft = F.interpolate(sd_features[-1], size=(16, 16), mode='bilinear', align_corners=False)
-
-        # 5. Prepare the multi-scale feature list for the Refine_Module, resizing each feature map
-        #    The expected order is [shallow, ..., deep]
-        img_feat_for_refine = [
-            F.interpolate(sd_features[0], size=(64, 64), mode='bilinear', align_corners=False), # Corresponds to adapter3
-            F.interpolate(sd_features[1], size=(32, 32), mode='bilinear', align_corners=False), # Corresponds to adapter2
-            F.interpolate(sd_features[2], size=(16, 16), mode='bilinear', align_corners=False), # Corresponds to adapter1
-            deepest_ft                                                                         # Corresponds to conv_adapter
-        ]
+        # resnet_features is now a list of 4 feature maps, e.g., [256, 512, 1024, 2048] channels
         # --- End of Modification ---
 
         _, src_indices = self.encode_to_z(meta['vm_crop'])
@@ -165,7 +150,7 @@ class C2F_Seg(nn.Module):
         masked_indices = self.mask_token_idx * torch.ones_like(tgt_indices, device=tgt_indices.device)  # [B, L]
         z_indices = (~mask) * tgt_indices + mask * masked_indices  # [B, L]
 
-        # Use the prepared 'deepest_ft' for the transformer
+        # Use the 'deepest_ft' (SD feature) for the transformer
         logits_z = self.transformer(deepest_ft, src_indices, z_indices, mask=None)
         target = tgt_indices
         z_loss = self.criterion(logits_z.view(-1, logits_z.size(-1)), target.view(-1))
@@ -180,8 +165,8 @@ class C2F_Seg(nn.Module):
             pred_fm_crop = pred_fm_crop.mean(dim=1, keepdim=True)
             pred_fm_crop = torch.clamp(pred_fm_crop, min=0, max=1)
 
-        # Use the prepared 'img_feat_for_refine' for the refinement module
-        pred_vm_crop, pred_fm_crop = self.refine_module(img_feat_for_refine, pred_fm_crop.detach())
+        # Use the 'resnet_features' for the refinement module
+        pred_vm_crop, pred_fm_crop = self.refine_module(resnet_features, pred_fm_crop.detach())
         pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
         pred_vm_crop = torch.sigmoid(pred_vm_crop)
         loss_vm = self.refine_criterion(pred_vm_crop, meta['vm_crop_gt'])
@@ -260,83 +245,7 @@ class C2F_Seg(nn.Module):
         out = logits.clone()
         out[out < v[..., [-1]]] = -float('Inf')
         return out
-    #@torch.no_grad()
-    # # def batch_predict_maskgit(self, meta, iter, mode, T=3, start_iter=0):
-    #     '''
-    #     :param x:[B,3,H,W] image
-    #     :param c:[b,X,H,W] condition
-    #     :param mask: [1,1,H,W] mask
-    #     '''
-    #     self.sample_iter += 1
-
-    #     img_feat = self.img_encoder(meta['img_crop'].permute((0,3,1,2)).to(torch.float32))
-
-    #     _, src_indices = self.encode_to_z(meta['vm_crop'])
-    #     # _, tgt_indices = self.encode_to_z(meta['fm_crop'])
-    #     bhwc = (_.shape[0], _.shape[2], _.shape[3], _.shape[1])
-
-    #     masked_indices = self.mask_token_idx * torch.ones_like(src_indices, device=src_indices.device) # [B, L]
-    #     unknown_number_in_the_beginning = torch.sum(masked_indices == self.mask_token_idx, dim=-1) # [B]
-
-    #     gamma = self.gamma_func("cosine")
-    #     cur_ids = masked_indices # [B, L]
-    #     seq_out = []
-    #     mask_out = []
-
-    #     for t in range(start_iter, T):
-    #         logits = self.transformer(img_feat[-1], src_indices, cur_ids, mask=None) # [B, L, N]
-    #         logits = logits[..., :-1]
-    #         logits = self.top_k_logits(logits, k=3)
-    #         probs = F.softmax(logits, dim=-1)  # convert logits into probs [B, 256, vocab_size+1]
-    #         sampled_ids = torch.distributions.categorical.Categorical(probs=probs).sample() # [B, L]
-
-    #         unknown_map = (cur_ids == self.mask_token_idx)  # which tokens need to be sampled -> bool [B, 256]
-    #         sampled_ids = torch.where(unknown_map, sampled_ids, cur_ids)  # replace all -1 with their samples and leave the others untouched [B, 256]
-    #         seq_out.append(sampled_ids)
-    #         mask_out.append(1. * unknown_map)
-
-    #         ratio = 1. * (t + 1) / T  # just a percentage e.g. 1 / 12
-    #         mask_ratio = gamma(ratio)
-    #         selected_probs = probs.gather(dim=-1, index=sampled_ids.unsqueeze(-1)).squeeze(-1)
-
-    #         selected_probs = torch.where(unknown_map, selected_probs, torch.Tensor([np.inf]).to(logits.device))  # ignore tokens which are already sampled [B, 256]
-            
-    #         mask_len = torch.unsqueeze(torch.floor(unknown_number_in_the_beginning * mask_ratio), 1)  # floor(256 * 0.99) = 254 --> [254, 254, 254, 254, ....] (B x 1)
-    #         mask_len = torch.maximum(torch.ones_like(mask_len), torch.minimum(torch.sum(unknown_map, dim=-1, keepdim=True) - 1, mask_len))
-
-    #         # Adds noise for randomness
-    #         masking = self.mask_by_random_topk(mask_len, selected_probs, temperature=self.choice_temperature * (1. - ratio))
-    #         # Masks tokens with lower confidence.
-    #         cur_ids = torch.where(masking, self.mask_token_idx, sampled_ids) # [B, L]
-
-    #     seq_ids = torch.stack(seq_out, dim=1) # [B, T, L]
-    #     quant_z = self.g_model.quantize.get_codebook_entry(seq_ids[:,-1,:].reshape(-1), shape=bhwc)
-    #     pred_fm_crop = self.g_model.decode(quant_z)
-    #     pred_fm_crop = pred_fm_crop.mean(dim=1, keepdim=True)
-    #     pred_fm_crop_old = torch.clamp(pred_fm_crop, min=0, max=1)
-
-    #     pred_vm_crop, pred_fm_crop = self.refine_module(img_feat, pred_fm_crop_old)
-
-    #     pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
-    #     pred_vm_crop = torch.sigmoid(pred_vm_crop)
-    #     loss_vm = self.refine_criterion(pred_vm_crop, meta['vm_crop_gt'])
-    #     # pred_vm_crop = (pred_vm_crop>=0.5).to(torch.float32)
-
-    #     pred_fm_crop = F.interpolate(pred_fm_crop, size=(256, 256), mode="nearest")
-    #     pred_fm_crop = torch.sigmoid(pred_fm_crop)
-    #     loss_fm = self.refine_criterion(pred_fm_crop, meta['fm_crop'])
-    #     # pred_fm_crop = (pred_fm_crop>=0.5).to(torch.float32)
-
-    #     pred_vm = self.align_raw_size(pred_vm_crop, meta['obj_position'], meta["vm_pad"], meta)
-    #     pred_fm = self.align_raw_size(pred_fm_crop, meta['obj_position'], meta["vm_pad"], meta)
-        
-    #     # visualization
-    #     self.visualize(pred_vm, pred_fm, meta, mode, iter)
-
-    #     loss_eval = self.loss_and_evaluation(pred_fm, meta, iter, mode, pred_vm=pred_vm)
-    #     loss_eval["loss_fm"] = loss_fm
-    #     loss_eval["loss_vm"] = loss_vm
-    #     return loss_eval 
+ 
     @torch.no_grad()
     def batch_predict_maskgit(self, meta, iter, mode, T=3, start_iter=0):
         '''
@@ -346,31 +255,17 @@ class C2F_Seg(nn.Module):
         '''
         self.sample_iter += 1
 
-        # --- 从这里开始修改 ---
-        # 1. 从 meta 字典中获取预加载的 SD 特征
-        sd_features = meta['sd_features']
-        # 2. 将特征移动到正确的 GPU 设备
-        sd_features = [f.to(self.config.device) for f in sd_features]
-        
-        # 3. DIFT 提取的 up_ft_index 0 是最深的，3 是最浅的。
-        #    我们需要将列表反转，以匹配C2F-Seg从浅到深的顺序。
-        sd_features.reverse()  # 现在 sd_features[0] 是最浅的, sd_features[3] 是最深的
+        # --- Start of Modification ---
+        # 1. Get the single, deepest SD feature for the Transformer
+        deepest_ft = meta['sd_feature'].to(self.config.device) # [B, C, H, W]
 
-        # 4. 为 Transformer 准备最深层的特征 (空间尺寸调整为 16x16)
-        deepest_ft = F.interpolate(sd_features[-1], size=(16, 16), mode='bilinear', align_corners=False)
-        
-        # 5. 为 RefineModule 准备多尺度特征列表
-        img_feat_for_refine = [
-            F.interpolate(sd_features[0], size=(64, 64), mode='bilinear', align_corners=False), # 对应 adapter3
-            F.interpolate(sd_features[1], size=(32, 32), mode='bilinear', align_corners=False), # 对应 adapter2
-            F.interpolate(sd_features[2], size=(16, 16), mode='bilinear', align_corners=False), # 对应 adapter1
-            deepest_ft                                                                         # 对应 conv_adapter
-        ]
-        # --- 修改结束 ---
+        # 2. Get ResNet features (which are frozen) for the Refine Module
+        img_crop_bchw = meta['img_crop'].permute((0, 3, 1, 2)).to(torch.float32)
+        resnet_features = self.img_encoder(img_crop_bchw)
+        # --- End of Modification ---
 
         _, src_indices = self.encode_to_z(meta['vm_crop'])
         
-        # 原始代码中有一个bug，变量 _ 在这里没有定义，我们用一个占位符来修复它
         try:
             bhwc = (_.shape[0], _.shape[2], _.shape[3], _.shape[1])
         except NameError:
@@ -388,7 +283,7 @@ class C2F_Seg(nn.Module):
         mask_out = []
 
         for t in range(start_iter, T):
-            # 使用准备好的 deepest_ft
+            # 使用 'deepest_ft' (SD feature)
             logits = self.transformer(deepest_ft, src_indices, cur_ids, mask=None) # [B, L, N]
             logits = logits[..., :-1]
             logits = self.top_k_logits(logits, k=3)
@@ -418,8 +313,8 @@ class C2F_Seg(nn.Module):
         pred_fm_crop = pred_fm_crop.mean(dim=1, keepdim=True)
         pred_fm_crop_old = torch.clamp(pred_fm_crop, min=0, max=1)
 
-        # 使用准备好的 img_feat_for_refine
-        pred_vm_crop, pred_fm_crop = self.refine_module(img_feat_for_refine, pred_fm_crop_old)
+        # 使用 'resnet_features'
+        pred_vm_crop, pred_fm_crop = self.refine_module(resnet_features, pred_fm_crop_old)
 
         pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
         pred_vm_crop = torch.sigmoid(pred_vm_crop)
@@ -544,5 +439,3 @@ class C2F_Seg(nn.Module):
             'refine': self.refine_module.state_dict(),
             'opt': self.opt.state_dict(),
         }, save_path)
-
-        
