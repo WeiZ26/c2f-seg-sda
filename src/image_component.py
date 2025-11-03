@@ -146,6 +146,10 @@ class MaskedTransformer(nn.Module):
         super().__init__()
         embedding_dim = config.n_embd
         num_embed = config.vocab_size+1
+        # --- 1. 添加归一化层 ---
+        # 对应 SD 最深层的 1280 通道
+        self.norm_in = nn.InstanceNorm2d(1280, affine=True) # affine=True 使其可学习
+        # --- 结束修改 ---
         # 修改前
         # self.conv_in = torch.nn.Conv2d(2048, embedding_dim//2, 3, padding=1)
         # 修改后:
@@ -172,7 +176,11 @@ class MaskedTransformer(nn.Module):
     def forward(self, img_feat, c_idx, z_idx, mask=None):
         # img_feat: [B, 2048, 16, 16]
         # attn_map: [B, 1,    16, 16]
-        i_embeddings = self.conv_in(img_feat) # [B, 768//2-1, 16, 16]
+        # --- 2. 应用归一化 ---
+        # 在送入 conv_in 之前归一化 SD 特征
+        img_feat_norm = self.norm_in(img_feat)
+        i_embeddings = self.conv_in(img_feat_norm) # [B, 768//2-1, 16, 16]
+        # --- 结束修改 ---
         i_embeddings = i_embeddings.flatten(2).transpose(-2, -1)
         # c and z embedding
         c_embeddings = self.c_emb(c_idx)    # [B, 256, D//4]
@@ -210,10 +218,10 @@ class Refine_Module(nn.Module):
     def __init__(self):
         super(Refine_Module, self).__init__()
         dim = 256 + 2
-        # 原代码: self.conv_adapter = torch.nn.Conv2d(2048, 2048, 1)
-        self.conv_adapter = torch.nn.Conv2d(1280, 1280, 1)        # 修改
-        # 原代码: self.conv_in = torch.nn.Conv2d(2048, 256, 3, padding=1)
-        self.conv_in = torch.nn.Conv2d(1280, 256, 3, padding=1) # 修改
+
+        self.conv_adapter = torch.nn.Conv2d(2048, 2048, 1)
+        self.conv_in = torch.nn.Conv2d(2048, 256, 3, padding=1)
+
 
         self.lay1 = torch.nn.Conv2d(dim, dim, 3, padding=1)
         self.bn1 = torch.nn.BatchNorm2d(dim)
@@ -223,8 +231,7 @@ class Refine_Module(nn.Module):
 
         self.lay3 = torch.nn.Conv2d(128, 64, 3, padding=1)
         self.bn3 = torch.nn.BatchNorm2d(64)
-        # 原代码: self.adapter1 = torch.nn.Conv2d(1024, 128, 1)
-        self.adapter1 = torch.nn.Conv2d(1280, 128, 1)            # 修改
+        self.adapter1 = torch.nn.Conv2d(1024, 128, 1)
 
         # visible mask branch
         self.lay4_vm = torch.nn.Conv2d(64, 32, 3, padding=1)
@@ -232,10 +239,10 @@ class Refine_Module(nn.Module):
         self.lay5_vm = torch.nn.Conv2d(32, 16, 3, padding=1)
         self.bn5_vm = torch.nn.BatchNorm2d(16)
 
-        # 原代码: self.adapter2_vm = torch.nn.Conv2d(512, 64, 1)
-        self.adapter2_vm = torch.nn.Conv2d(640, 64, 1)           # 修改
-        # 原代码: self.adapter3_vm = torch.nn.Conv2d(256, 32, 1)
-        self.adapter3_vm = torch.nn.Conv2d(320, 32, 1)           # 修改
+        self.adapter2_vm = torch.nn.Conv2d(512, 64, 1)
+    
+        self.adapter3_vm = torch.nn.Conv2d(256, 32, 1)
+        
         self.out_lay_vm = torch.nn.Conv2d(16, 1, 3, padding=1)
 
         # amodal mask branch
@@ -243,11 +250,9 @@ class Refine_Module(nn.Module):
         self.bn4_am = torch.nn.BatchNorm2d(32)
         self.lay5_am = torch.nn.Conv2d(32, 16, 3, padding=1)
         self.bn5_am = torch.nn.BatchNorm2d(16)
-        # 原代码: self.adapter2_am = torch.nn.Conv2d(512, 64, 1)
-        self.adapter2_am = torch.nn.Conv2d(640, 64, 1)           # 修改
-
-        # 原代码: self.adapter3_am = torch.nn.Conv2d(256, 32, 1)
-        self.adapter3_am = torch.nn.Conv2d(320, 32, 1)           # 修改
+        self.adapter2_am = torch.nn.Conv2d(512, 64, 1)
+    
+        self.adapter3_am = torch.nn.Conv2d(256, 32, 1)
         self.out_lay_am = torch.nn.Conv2d(16, 1, 3, padding=1)
     
     def get_attn_map(self, feature, guidance):
@@ -263,9 +268,9 @@ class Refine_Module(nn.Module):
         return attn
     
     def forward(self, features, coarse_mask):
-        # features:    [B, 2048, 16,   16]
-        # attn_map:    [B, 1,    16,   16]
-        # coarse_mask: [B, 1,    256, 256]
+        # features: [B, 256, 64, 64], [B, 512, 32, 32], [B, 1024, 16, 16], [B, 2048, 16, 16]
+        # (来自 ResNet)
+        
         feat = self.conv_adapter(features[-1])
         coarse_mask = F.interpolate(coarse_mask, scale_factor=(1/16))
         attn_map = self.get_attn_map(feat, coarse_mask)
@@ -274,31 +279,31 @@ class Refine_Module(nn.Module):
         x = F.relu(self.bn1(self.lay1(x)))
         x = F.relu(self.bn2(self.lay2(x)))
         
-        cur_feat = self.adapter1(features[-2])
+        cur_feat = self.adapter1(features[-2]) # (ResNet: 1024)
         x = cur_feat + x
         x = F.interpolate(x, size=(32, 32), mode="nearest")
         x = F.relu(self.bn3(self.lay3(x)))
 
-        # TODO: visible mask branch
-        cur_feat_vm = self.adapter2_vm(features[-3])
+        # visible mask branch
+        cur_feat_vm = self.adapter2_vm(features[-3]) # (ResNet: 512)
         x_vm = cur_feat_vm + x
         x_vm = F.interpolate(x_vm, size=(64, 64), mode="nearest")
         x_vm = F.relu(self.bn4_vm(self.lay4_vm(x_vm)))
 
-        cur_feat_vm = self.adapter3_vm(features[-4])
+        cur_feat_vm = self.adapter3_vm(features[-4]) # (ResNet: 256)
         x_vm = cur_feat_vm + x_vm
         x_vm = F.interpolate(x_vm, size=(128, 128), mode="nearest")
         x_vm = F.relu(self.bn5_vm(self.lay5_vm(x_vm)))
         
         x_vm = self.out_lay_vm(x_vm)
 
-        # TODO: full mask branch
-        cur_feat_am = self.adapter2_am(features[-3])
+        # amodal mask branch
+        cur_feat_am = self.adapter2_am(features[-3]) # (ResNet: 512)
         x_am = cur_feat_am + x
         x_am = F.interpolate(x_am, size=(64, 64), mode="nearest")
         x_am = F.relu(self.bn4_am(self.lay4_am(x_am)))
 
-        cur_feat_am = self.adapter3_am(features[-4])
+        cur_feat_am = self.adapter3_am(features[-4]) # (ResNet: 256)
         x_am = cur_feat_am + x_am
         x_am = F.interpolate(x_am, size=(128, 128), mode="nearest")
         x_am = F.relu(self.bn5_am(self.lay5_am(x_am)))

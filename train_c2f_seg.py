@@ -112,6 +112,8 @@ if __name__ == '__main__':
         batch_size=config.batch_size,
         num_workers=config.train_num_workers,
         drop_last=True,
+        pin_memory=True,  # 添加: 加速 CPU -> GPU 内存拷贝
+        persistent_workers=(config.train_num_workers > 0) # 添加: 保持 worker 进程
     )
     
     test_loader = DataLoader(
@@ -119,6 +121,8 @@ if __name__ == '__main__':
         batch_size=config.batch_size,
         num_workers=config.test_num_workers,
         drop_last=False,
+        pin_memory=True,  # 添加
+        persistent_workers=(config.test_num_workers > 0) # 添加
     )
     
     sample_iterator = test_dataset.create_iterator(config.sample_size)

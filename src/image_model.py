@@ -41,11 +41,11 @@ class C2F_Seg(nn.Module):
         self.train_sample_iters = config.train_sample_iters
         
         self.g_model = VQModel(self.g_config).to(config.device)
-        # self.img_encoder = Resnet_Encoder().to(config.device)
+        self.img_encoder = Resnet_Encoder().to(config.device)
         self.refine_module = Refine_Module().to(config.device)
         self.transformer = MaskedTransformer(config).to(config.device)
         self.g_model.eval()
-
+        self.img_encoder.eval() #
         self.refine_criterion = nn.BCELoss()
         self.criterion = CrossEntropyLoss(num_classes=config.vocab_size+1, device=config.device)
 
@@ -121,53 +121,6 @@ class C2F_Seg(nn.Module):
         attn = attn.reshape(b, c, h, w)
         return attn
 
-    """ def get_losses(self, meta):
-        self.iteration += 1
-        z_loss = 0
-        img_feat = self.img_encoder(meta['img_crop'].permute((0,3,1,2)).to(torch.float32))
-        _, src_indices = self.encode_to_z(meta['vm_crop'])
-        _, tgt_indices = self.encode_to_z(meta['fm_crop'])
-        bhwc = (_.shape[0], _.shape[2], _.shape[3], _.shape[1])
-        r = np.maximum(self.gamma(np.random.uniform()), self.config.min_mask_rate)
-        r = math.floor(r * tgt_indices.shape[1])
-        sample = torch.rand(tgt_indices.shape, device=tgt_indices.device).topk(r, dim=1).indices
-        random_mask = torch.zeros(tgt_indices.shape, dtype=torch.bool, device=tgt_indices.device)
-        random_mask.scatter_(dim=1, index=sample, value=True) # [B, L]
-        # concat mask
-        mask = random_mask
-        masked_indices = self.mask_token_idx * torch.ones_like(tgt_indices, device=tgt_indices.device) # [B, L]
-        z_indices = (~mask) * tgt_indices + mask * masked_indices # [B, L]
-
-        logits_z = self.transformer(img_feat[-1], src_indices, z_indices, mask=None)        
-        target = tgt_indices
-        z_loss = self.criterion(logits_z.view(-1, logits_z.size(-1)), target.view(-1))
-
-        with torch.no_grad():
-            logits_z = logits_z[..., :-1]
-            logits_z = self.top_k_logits(logits_z, k=5)
-            probs = F.softmax(logits_z, dim=-1)
-            seq_ids = torch.distributions.categorical.Categorical(probs=probs).sample() # [B, L]
-            quant_z = self.g_model.quantize.get_codebook_entry(seq_ids.reshape(-1), shape=bhwc)
-            pred_fm_crop = self.g_model.decode(quant_z)
-            pred_fm_crop = pred_fm_crop.mean(dim=1, keepdim=True)
-            pred_fm_crop = torch.clamp(pred_fm_crop, min=0, max=1)
-
-        pred_vm_crop, pred_fm_crop = self.refine_module(img_feat, pred_fm_crop.detach())
-        pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
-        pred_vm_crop = torch.sigmoid(pred_vm_crop)
-        loss_vm = self.refine_criterion(pred_vm_crop, meta['vm_crop_gt'])
-        # pred_vm_crop = (pred_vm_crop>=0.5).to(torch.float32)
-
-        pred_fm_crop = F.interpolate(pred_fm_crop, size=(256, 256), mode="nearest")
-        pred_fm_crop = torch.sigmoid(pred_fm_crop)
-        loss_fm = self.refine_criterion(pred_fm_crop, meta['fm_crop'])
-        # pred_fm_crop = (pred_fm_crop>=0.5).to(torch.float32)
-        logs = [
-            ("z_loss", z_loss.item()),
-            ("loss_vm", loss_vm.item()),
-            ("loss_fm", loss_fm.item()),
-        ]
-        return z_loss, loss_vm+loss_fm, logs """
     
     def get_losses(self, meta):
         self.iteration += 1
@@ -176,6 +129,10 @@ class C2F_Seg(nn.Module):
         # --- Start of Modification ---
         # 1. Retrieve pre-loaded SD features from the meta dictionary
         sd_features = meta['sd_features']
+        with torch.no_grad(): # 确保 ResNet 冻结
+            # Dataloader 提供的 img_crop 是 [B, H, W, 3], ResNet 需要 [B, 3, H, W]
+            img_crop_bchw = meta['img_crop'].permute((0, 3, 1, 2)).to(torch.float32)
+            resnet_features = self.img_encoder(img_crop_bchw)
         # 2. Move features to the correct GPU device
         sd_features = [f.to(self.config.device) for f in sd_features]
 

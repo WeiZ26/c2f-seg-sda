@@ -7,6 +7,7 @@ import cvbase as cvb
 from PIL import Image
 from skimage import transform
 import torch
+import lmdb
 from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 import pycocotools.mask as mask_utils
@@ -36,7 +37,7 @@ class KINS_VQ_dataset(torch.utils.data.Dataset):
         self.patch_h = 256
         self.patch_w = 256
         self.device = "cpu"
-
+    
     def __len__(self):
         return len(self.image_list)
 
@@ -170,270 +171,24 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
         self.patch_h = 256
         self.patch_w = 256
         self.device = "cpu"
-
+        # --- 2. 修改：指向新的单层特征目录 ---
+        self.sd_feature_base_path = "/data1/CLB/c2f-seg/amodal-completion-in-the-wild/kins_sd_features_single_deepest"
+        # --- 修改结束 ---
     def __len__(self):
         return self.label_info.shape[0]
 
     def __getitem__(self, index):
-        return self.load_item(index)
-        
-    """ def load_item(self, index):
-        # load aisformer predicted visible masks
-        if "aisformer" in self.label_info[index]:
-            dataset_name, image_id, anno_id = self.label_info[index].split(",")
-            image_id, anno_id = int(image_id), int(anno_id)
-            # add image information
-            img_name = self.images[image_id]
-            img_path = os.path.join(self.img_root_path, img_name)
-            # img_path = os.path.join(self.img_root_path, str(image_id).zfill(6)+ ".png")
-            img = np.array(Image.open(img_path))
-            instances = self.data_info['{}_{}'.format(dataset_name, image_id)][anno_id]
-            segmentation = instances["pred_visible_mask"]
-            height, width = segmentation["size"]
-            vm_no_crop = mask_utils.decode([segmentation]).astype(bool)
-            vm_no_crop_gt = mask_utils.decode([instances["gt_visible_mask"]]).astype(bool)
-            rles = mask_utils.frPyObjects(instances["gt_full_mask"], height, width)
-            fm_no_crop = mask_utils.decode(mask_utils.merge(rles)).astype(bool)
-            fm_no_crop = fm_no_crop[..., np.newaxis]
-
-            bbox = instances["pred_visible_mask_bbox"]
-            y_min, x_min, w, h = bbox
-            y_max, x_max = y_min + w, x_min + h
-            x_center = (x_min + x_max) // 2
-            y_center = (y_min + y_max) // 2
-            x_len = int((x_max - x_min) * self.enlarge_coef)
-            y_len = int((y_max - y_min) * self.enlarge_coef)
-            x_min = max(0, x_center - x_len // 2)
-            x_max = min(height, x_center + x_len // 2)
-            y_min = max(0, y_center - y_len // 2)
-            y_max = min(width, y_center + y_len // 2)
-            x_min, x_max, y_min, y_max = int(x_min), int(x_max), int(y_min), int(y_max)
-        
-            vm_crop = vm_no_crop[x_min:x_max+1, y_min:y_max+1, 0].astype(bool)
-            vm_crop_gt = vm_no_crop_gt[x_min:x_max+1, y_min:y_max+1, 0].astype(bool)
-            fm_crop = fm_no_crop[x_min:x_max+1, y_min:y_max+1, 0].astype(bool)
-            img_crop = img[x_min:x_max+1, y_min:y_max+1]
-            
-            h, w = vm_crop.shape[:2]
-            m = transform.rescale(vm_crop, (self.patch_h/h, self.patch_w/w))
-            cur_h, cur_w = m.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)))
-            m = np.pad(m, to_pad)[:self.patch_h, :self.patch_w]
-            vm_crop = m[np.newaxis, ...]
-
-            img_ = transform.rescale(img_crop, (self.patch_h/h, self.patch_w/w, 1))
-            cur_h, cur_w = img_.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)), (0, 0))
-            img_ = np.pad(img_, to_pad)[:self.patch_h, :self.patch_w, :3]
-            img_crop = img_
-
-            # data augmentation
-            vm_crop_aug = self.data_augmentation(vm_crop[0])[np.newaxis, ...]
-
-            h, w = vm_crop_gt.shape[:2]
-            m = transform.rescale(vm_crop_gt, (self.patch_h/h, self.patch_w/w))
-            cur_h, cur_w = m.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)))
-            m = np.pad(m, to_pad)[:self.patch_h, :self.patch_w]
-            vm_crop_gt = m[np.newaxis, ...]
-
-            m = transform.rescale(fm_crop, (self.patch_h/h, self.patch_w/w))
-            cur_h, cur_w = m.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)))
-            m = np.pad(m, to_pad)[:self.patch_h, :self.patch_w]    
-            fm_crop = m[np.newaxis, ...]
-
-            loss_mask = fm_no_crop.astype(int)-vm_no_crop_gt.astype(int)
-            loss_mask[loss_mask==255]=0
-            loss_mask = 1-loss_mask.astype(bool)
-
-            vm_no_crop = vm_no_crop[np.newaxis, ...]
-            fm_no_crop = fm_no_crop[np.newaxis, ...]
-
-            obj_position = np.array([x_min, x_max, y_min, y_max])
-            vm_pad = np.array([max(self.patch_h-cur_h, 0), max(self.patch_w-cur_w, 0)])
-            vm_scale = np.array([self.patch_h/h, self.patch_w/w])
-            counts = np.array([1])
-            
-            counts = torch.from_numpy(counts).to(self.dtype).to(self.device)
-
-            obj_position = torch.from_numpy(obj_position).to(self.dtype).to(self.device)
-            vm_pad = torch.from_numpy(vm_pad).to(self.dtype).to(self.device)
-            vm_scale = torch.from_numpy(vm_scale).to(self.dtype).to(self.device)
-
-            fm_crop = torch.from_numpy(fm_crop).to(self.dtype).to(self.device)
-            fm_no_crop = torch.from_numpy(np.array(fm_no_crop)).to(self.dtype).to(self.device)
-            vm_crop_aug = torch.from_numpy(vm_crop_aug).to(self.dtype).to(self.device)
-            vm_crop_gt = torch.from_numpy(vm_crop_gt).to(self.dtype).to(self.device)
-            vm_no_crop = torch.from_numpy(np.array(vm_no_crop)).to(self.dtype).to(self.device)
-            vm_no_crop_gt = torch.from_numpy(np.array(vm_no_crop_gt)).to(self.dtype).to(self.device)
-
-            img_crop = torch.from_numpy(np.array(img_crop)).to(self.dtype).to(self.device)
-
-            loss_mask = torch.from_numpy(np.array(loss_mask)).to(self.dtype).to(self.device)
-        
-            image_id = torch.from_numpy(np.array(image_id)).to(self.dtype).to(self.device)
-            anno_id = torch.from_numpy(np.array(anno_id)).to(self.dtype).to(self.device)
-            
-            if self.mode=="train":
-                meta = {
-                    # "vm_no_crop": vm_no_crop,
-                    "vm_crop": vm_crop_aug,
-                    "vm_crop_gt": vm_crop_gt,
-                    # "fm_no_crop": fm_no_crop,
-                    "fm_crop": fm_crop,
-                    "img_crop": img_crop,
-                    # "loss_mask": loss_mask,
-                    "obj_position": obj_position,
-                    "vm_pad": vm_pad,
-                    "vm_scale": vm_scale,
-                    "counts":counts,
-                    "img_id": image_id,
-                    "anno_id": anno_id,
-                }
-            elif self.mode=="test":
-                meta = {
-                    "vm_no_crop": vm_no_crop,
-                    "vm_no_crop_gt": vm_no_crop_gt,
-                    "vm_crop": vm_crop,
-                    "vm_crop_gt": vm_crop_gt,
-                    "fm_no_crop": fm_no_crop,
-                    "fm_crop": fm_crop,
-                    "img_crop": img_crop,
-                    "loss_mask": loss_mask,
-                    "obj_position": obj_position,
-                    "vm_pad": vm_pad,
-                    "vm_scale": vm_scale,
-                    "counts":counts,
-                    "img_id": image_id,
-                    "anno_id": anno_id,
-                }
-            return meta
-        else:
-            img_id, anno_id, category_id = self.label_info[index].split("_")
-            img_id, anno_id, category_id = int(img_id), int(anno_id), int(category_id)
-
-            img_name = self.imgs_dict[img_id]
-            img_path = os.path.join(self.base_img_path, img_name)
-            
-            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-            height, width, _ = img.shape
-            
-            ann = self.anns_dict[img_id][anno_id]
-            fm_no_crop = self.polys_to_mask(ann["a_segm"], height, width)
-            vm_no_crop = self.polys_to_mask(ann["i_segm"], height, width)
-            if np.sum(vm_no_crop)==0:
-                counts = np.array([0])
-            else:
-                counts = np.array([1])
-            y_min, x_min, w, h = ann["i_bbox"]
-
-            y_max, x_max = y_min + w, x_min + h
-            x_center = (x_min + x_max) // 2
-            y_center = (y_min + y_max) // 2
-            x_len = int((x_max - x_min) * self.enlarge_coef)
-            y_len = int((y_max - y_min) * self.enlarge_coef)
-            x_min = max(0, x_center - x_len // 2)
-            x_max = min(height, x_center + x_len // 2)
-            y_min = max(0, y_center - y_len // 2)
-            y_max = min(width, y_center + y_len // 2)
-            
-            fm_crop = fm_no_crop[x_min:x_max+1, y_min:y_max+1].astype(bool)
-            vm_crop = vm_no_crop[x_min:x_max+1, y_min:y_max+1].astype(bool)
-            img_crop = img[x_min:x_max+1, y_min:y_max+1]
-
-            h, w = vm_crop.shape[:2]
-            m = transform.rescale(vm_crop, (self.patch_h/h, self.patch_w/w))
-            cur_h, cur_w = m.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)))
-            m = np.pad(m, to_pad)[:self.patch_h, :self.patch_w]
-            vm_crop = m[np.newaxis, ...]
-
-            img_ = transform.rescale(img_crop, (self.patch_h/h, self.patch_w/w, 1))
-            cur_h, cur_w = img_.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)), (0, 0))
-            img_ = np.pad(img_, to_pad)[:self.patch_h, :self.patch_w, :3]
-            img_crop = img_
-
-            m = transform.rescale(fm_crop, (self.patch_h/h, self.patch_w/w))
-            cur_h, cur_w = m.shape[:2]
-            to_pad = ((0, max(self.patch_h-cur_h, 0)), (0, max(self.patch_w-cur_w, 0)))
-            m = np.pad(m, to_pad)[:self.patch_h, :self.patch_w]    
-            fm_crop = m[np.newaxis, ...]
-
-            obj_position = np.array([x_min, x_max, y_min, y_max])
-            vm_pad = np.array([max(self.patch_h-cur_h, 0), max(self.patch_w-cur_w, 0)])
-            vm_scale = np.array([self.patch_h/h, self.patch_w/w])
-
-            vm_no_crop = vm_no_crop[np.newaxis, ...]
-            fm_no_crop = fm_no_crop[np.newaxis, ...]
-
-            loss_mask = fm_no_crop-vm_no_crop
-            loss_mask[loss_mask==255]=0
-            loss_mask = 1-loss_mask.astype(bool)
-            # data augmentation
-            vm_crop_aug = self.data_augmentation(vm_crop[0])[np.newaxis, ...]
-            counts = torch.from_numpy(counts).to(self.dtype).to(self.device)
-
-            obj_position = torch.from_numpy(obj_position).to(self.dtype).to(self.device)
-            vm_pad = torch.from_numpy(vm_pad).to(self.dtype).to(self.device)
-            vm_scale = torch.from_numpy(vm_scale).to(self.dtype).to(self.device)
-
-            fm_crop = torch.from_numpy(fm_crop).to(self.dtype).to(self.device)
-            fm_no_crop = torch.from_numpy(np.array(fm_no_crop)).to(self.dtype).to(self.device)
-            # vm_crop here is the GT
-            vm_crop = torch.from_numpy(vm_crop).to(self.dtype).to(self.device)
-            vm_crop_aug = torch.from_numpy(vm_crop_aug).to(self.dtype).to(self.device)
-            vm_no_crop = torch.from_numpy(np.array(vm_no_crop)).to(self.dtype).to(self.device)
-            img_crop = torch.from_numpy(np.array(img_crop)).to(self.dtype).to(self.device)
-            loss_mask = torch.from_numpy(np.array(loss_mask)).to(self.dtype).to(self.device)
-        
-            img_id = torch.from_numpy(np.array(img_id)).to(self.dtype).to(self.device)
-            anno_id = torch.from_numpy(np.array(anno_id)).to(self.dtype).to(self.device)
-            # category_id = torch.from_numpy(np.array(category_id)).to(self.dtype).to(self.device)
-            if self.mode=="train":
-                meta = {
-                    # "vm_no_crop": vm_no_crop,
-                    "vm_crop": vm_crop_aug,
-                    "vm_crop_gt": vm_crop,
-                    # "fm_no_crop": fm_no_crop,
-                    "fm_crop": fm_crop,
-                    "img_crop": img_crop,
-                    # "loss_mask": loss_mask,
-                    "obj_position": obj_position,
-                    "vm_pad": vm_pad,
-                    "vm_scale": vm_scale,
-                    "counts":counts,
-                    "img_id": img_id,
-                    "anno_id": anno_id,
-                    # for vq
-                    # "mask_crop": fm_crop
-                }
-            elif self.mode=="test":
-                meta = {
-                    "vm_no_crop": vm_no_crop,
-                    "vm_crop": vm_crop,
-                    "vm_crop_gt": vm_crop,
-                    "fm_no_crop": fm_no_crop,
-                    "vm_no_crop_gt": vm_no_crop,
-                    "fm_crop": fm_crop,
-                    "img_crop": img_crop,
-                    "loss_mask": loss_mask,
-                    "obj_position": obj_position,
-                    "vm_pad": vm_pad,
-                    "vm_scale": vm_scale,
-                    "counts":counts,
-                    "img_id": img_id,
-                    "anno_id": anno_id,
-                    # for vq
-                    # "mask_crop": fm_crop
-                }
-            return meta """
+        try:
+            return self.load_item(index)
+        except Exception as e:
+            print(f"加载索引 {index} (label: {self.label_info[index]}) 时出错: {e}")
+            return None # 返回 None，让 collate_fn 来处理
+    
     def load_item(self, index):
         # <<<--- ADD THIS PATH DEFINITION AT THE TOP ---
         # Define the root directory where you stored the extracted Stable Diffusion features.
         # !!! IMPORTANT: Please replace this with your actual path.
-        sd_feature_base_path = "/data1/CLB/amodal-completion-in-the-wild/kins_sd_features"
+
         # ---------------------------------------------
 
         # load aisformer predicted visible masks
@@ -445,18 +200,24 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
             img_path = os.path.join(self.img_root_path, img_name)
             img = np.array(Image.open(img_path))
             
-            # <<<--- ADD FEATURE LOADING LOGIC HERE (AISFORMER BRANCH) --- START
-            image_basename = os.path.basename(img_path).replace('.png', '.pt')
+           
             # sd_features = []
             # for i in range(4):
             #     feature_path = os.path.join(sd_feature_base_path, f't_181_up-ft-index_{i}', image_basename)
             #     feature = torch.load(feature_path, map_location='cpu')
             #     sd_features.append(feature)
             # 修改为:
-            feature_path = os.path.join(sd_feature_base_path, image_basename)
-            sd_features = torch.load(feature_path, map_location='cpu') # 一次性加载包含4个张量的列表
-            
-            # <<<--- ADD FEATURE LOADING LOGIC HERE --- END
+            # <<<--- 修改 (AISFORMER 分支) --- START
+            # --- 5. 修改：从 LMDB 中读取特征 (AISFORMER 分支) ---
+            # 键 (key) 是 .pt 文件名, e.g., '000001.pt'
+           # --- 3. 修改：使用 mmap 加载单个 .npy 特征 ---
+            image_basename_npy = os.path.basename(img_path).replace('.png', '.npy')
+            feature_path = os.path.join(self.sd_feature_base_path, image_basename_npy)
+
+            # mmap_mode='r' 现在可以工作了！
+            numpy_array_f16 = np.load(feature_path, mmap_mode='r') 
+            sd_feature = torch.from_numpy(numpy_array_f16).float() # 转换为 float32
+            # --- 修改结束 ---
 
             instances = self.data_info['{}_{}'.format(dataset_name, image_id)][anno_id]
             segmentation = instances["pred_visible_mask"]
@@ -586,16 +347,19 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
             img_path = os.path.join(self.base_img_path, img_name)
             
             # <<<--- ADD FEATURE LOADING LOGIC HERE (GROUND TRUTH BRANCH) --- START
-            image_basename = os.path.basename(img_path).replace('.png', '.pt')
             # sd_features = []  
             # for i in range(4):
             #     feature_path = os.path.join(sd_feature_base_path, f't_181_up-ft-index_{i}', image_basename)
             #     feature = torch.load(feature_path, map_location='cpu')
             #     sd_features.append(feature)
             # # <<<--- ADD FEATURE LOADING LOGIC HERE --- END
-            # 修改为:
-            feature_path = os.path.join(sd_feature_base_path, image_basename)
-            sd_features = torch.load(feature_path, map_location='cpu') # 一次性加载包含4个张量的列表
+           # --- 3. 修改：使用 mmap 加载单个 .npy 特征 ---
+            image_basename_npy = os.path.basename(img_path).replace('.png', '.npy')
+            feature_path = os.path.join(self.sd_feature_base_path, image_basename_npy)
+            
+            numpy_array_f16 = np.load(feature_path, mmap_mode='r')
+            sd_feature = torch.from_numpy(numpy_array_f16).float() # 转换为 float32
+            # --- 修改结束 ---
             
             img = cv2.imread(img_path, cv2.IMREAD_COLOR)
             height, width, _ = img.shape
@@ -730,6 +494,11 @@ class Kins_Fusion_dataset(torch.utils.data.Dataset):
     
     @staticmethod
     def collate_fn(batch):
+        # --- 5. 修改：添加一个过滤器以移除 None (加载失败的样本) ---
+        batch = list(filter(lambda x: x is not None, batch))
+        if len(batch) == 0:
+            return None 
+        # --- 结束修改 ---
         keys = batch[0].keys()
         res = {}
         for k in keys:
