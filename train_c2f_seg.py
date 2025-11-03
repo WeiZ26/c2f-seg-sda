@@ -101,8 +101,10 @@ if __name__ == '__main__':
     model = C2F_Seg(config, vq_model_path, mode='train', logger=logger)
     model.load(is_test=False, prefix = config.stage2_iteration)
     model.restore_from_stage1(prefix = config.stage1_iteration)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
-
+    # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+    # --- 修正: 添加 find_unused_parameters=True ---
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
+    # --- 修正结束 ---
     # load dataset
     train_dataset, test_dataset = load_dataset(config, args, "train")
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
