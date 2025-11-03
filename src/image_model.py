@@ -45,7 +45,9 @@ class C2F_Seg(nn.Module):
         self.refine_module = Refine_Module().to(config.device)
         self.transformer = MaskedTransformer(config).to(config.device)
         self.g_model.eval()
-        self.img_encoder.eval() #
+        # --- 修正: 移除 self.img_encoder.eval()，使其可训练 ---
+        # self.img_encoder.eval() 
+        # --- 修正结束 ---
         self.refine_criterion = nn.BCELoss()
         self.criterion = CrossEntropyLoss(num_classes=config.vocab_size+1, device=config.device)
 
@@ -75,14 +77,18 @@ class C2F_Seg(nn.Module):
         # loss
         no_decay = ['bias', 'ln1.bias', 'ln1.weight', 'ln2.bias', 'ln2.weight']
         param_optimizer = self.transformer.named_parameters()
-        # param_optimizer_encoder = self.img_encoder.named_parameters()
+        # --- 修正: 将 img_encoder (ResNet) 添加回优化器 ---
+        param_optimizer_encoder = self.img_encoder.named_parameters()
+        # --- 修正结束 ---
         param_optimizer_refine= self.refine_module.named_parameters()
         optimizer_parameters = [
             {'params': [p for n, p in param_optimizer if not any([nd in n for nd in no_decay])],
             'weight_decay': config.weight_decay},
             {'params': [p for n, p in param_optimizer if any([nd in n for nd in no_decay])],
             'weight_decay': 0.0},
-            # {'params': [p for n, p in param_optimizer_encoder], 'weight_decay': config.weight_decay},
+            # --- 修正: 取消注释下一行以训练 ResNet ---
+            {'params': [p for n, p in param_optimizer_encoder], 'weight_decay': config.weight_decay},
+            # --- 修正结束 ---
             {'params': [p for n, p in param_optimizer_refine], 'weight_decay': config.weight_decay},
         ]
 
@@ -127,15 +133,17 @@ class C2F_Seg(nn.Module):
         z_loss = 0
 
         # --- Start of Modification ---
-        # 1. Get the single, deepest SD feature for the Transformer
-        #    It was loaded as 'sd_feature' (singular) in the dataloader
-        deepest_ft = meta['sd_feature'].to(self.config.device) # [B, C, H, W]
+        # 1. 获取 SD 特征 (用于 Transformer)
+        # Dataloader 提供了 'sd_feature' (B, C, H, W)
+        deepest_ft = meta['sd_feature'].to(self.config.device)
+        # 确保 SD 特征尺寸正确 (16x16)
+        deepest_ft = F.interpolate(deepest_ft, size=(16, 16), mode='bilinear', align_corners=False)
 
-        # 2. Get ResNet features (which are frozen) for the Refine Module
-        with torch.no_grad(): 
-            img_crop_bchw = meta['img_crop'].permute((0, 3, 1, 2)).to(torch.float32)
-            resnet_features = self.img_encoder(img_crop_bchw)
-        # resnet_features is now a list of 4 feature maps, e.g., [256, 512, 1024, 2048] channels
+        # 2. 获取 ResNet 特征 (用于 Refine Module)
+        # 将 img_encoder 的调用移出 no_grad() 块以进行训练
+        img_crop_bchw = meta['img_crop'].permute((0, 3, 1, 2)).to(torch.float32)
+        resnet_features = self.img_encoder(img_crop_bchw) 
+        # resnet_features 是一个包含4个特征图的列表
         # --- End of Modification ---
 
         _, src_indices = self.encode_to_z(meta['vm_crop'])
@@ -150,8 +158,11 @@ class C2F_Seg(nn.Module):
         masked_indices = self.mask_token_idx * torch.ones_like(tgt_indices, device=tgt_indices.device)  # [B, L]
         z_indices = (~mask) * tgt_indices + mask * masked_indices  # [B, L]
 
-        # Use the 'deepest_ft' (SD feature) for the transformer
+        # --- 3. 传递正确的特征 ---
+        # 将 'deepest_ft' (SD feature) 传递给 transformer
         logits_z = self.transformer(deepest_ft, src_indices, z_indices, mask=None)
+        # --- 修正结束 ---
+        
         target = tgt_indices
         z_loss = self.criterion(logits_z.view(-1, logits_z.size(-1)), target.view(-1))
 
@@ -165,8 +176,11 @@ class C2F_Seg(nn.Module):
             pred_fm_crop = pred_fm_crop.mean(dim=1, keepdim=True)
             pred_fm_crop = torch.clamp(pred_fm_crop, min=0, max=1)
 
-        # Use the 'resnet_features' for the refinement module
+        # --- 4. 传递正确的特征 ---
+        # 将 'resnet_features' 传递给 refine_module
         pred_vm_crop, pred_fm_crop = self.refine_module(resnet_features, pred_fm_crop.detach())
+        # --- 修正结束 ---
+        
         pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
         pred_vm_crop = torch.sigmoid(pred_vm_crop)
         loss_vm = self.refine_criterion(pred_vm_crop, meta['vm_crop_gt'])
@@ -245,7 +259,7 @@ class C2F_Seg(nn.Module):
         out = logits.clone()
         out[out < v[..., [-1]]] = -float('Inf')
         return out
- 
+
     @torch.no_grad()
     def batch_predict_maskgit(self, meta, iter, mode, T=3, start_iter=0):
         '''
@@ -258,6 +272,7 @@ class C2F_Seg(nn.Module):
         # --- Start of Modification ---
         # 1. Get the single, deepest SD feature for the Transformer
         deepest_ft = meta['sd_feature'].to(self.config.device) # [B, C, H, W]
+        deepest_ft = F.interpolate(deepest_ft, size=(16, 16), mode='bilinear', align_corners=False)
 
         # 2. Get ResNet features (which are frozen) for the Refine Module
         img_crop_bchw = meta['img_crop'].permute((0, 3, 1, 2)).to(torch.float32)
@@ -283,8 +298,11 @@ class C2F_Seg(nn.Module):
         mask_out = []
 
         for t in range(start_iter, T):
+            # --- 3. 传递正确的特征 ---
             # 使用 'deepest_ft' (SD feature)
             logits = self.transformer(deepest_ft, src_indices, cur_ids, mask=None) # [B, L, N]
+            # --- 修正结束 ---
+            
             logits = logits[..., :-1]
             logits = self.top_k_logits(logits, k=3)
             probs = F.softmax(logits, dim=-1)
@@ -313,8 +331,10 @@ class C2F_Seg(nn.Module):
         pred_fm_crop = pred_fm_crop.mean(dim=1, keepdim=True)
         pred_fm_crop_old = torch.clamp(pred_fm_crop, min=0, max=1)
 
+        # --- 4. 传递正确的特征 ---
         # 使用 'resnet_features'
         pred_vm_crop, pred_fm_crop = self.refine_module(resnet_features, pred_fm_crop_old)
+        # --- 修正结束 ---
 
         pred_vm_crop = F.interpolate(pred_vm_crop, size=(256, 256), mode="nearest")
         pred_vm_crop = torch.sigmoid(pred_vm_crop)
@@ -397,7 +417,10 @@ class C2F_Seg(nn.Module):
                 data = torch.load(transformer_path, map_location="cpu")
                 
                 torch_init_model(self.transformer, transformer_path, 'model')
-                # torch_init_model(self.img_encoder, transformer_path, 'img_encoder')
+                # --- 修正: 确保 img_encoder 的权重也被加载（如果它们在检查点中） ---
+                if 'img_encoder' in data:
+                    torch_init_model(self.img_encoder, transformer_path, 'img_encoder')
+                # --- 修正结束 ---
                 torch_init_model(self.refine_module, transformer_path, 'refine')
 
                 if self.config.restore:
@@ -435,7 +458,9 @@ class C2F_Seg(nn.Module):
             'iteration': self.iteration,
             'sample_iter': self.sample_iter,
             'model': self.transformer.state_dict(),
-            # 'img_encoder': self.img_encoder.state_dict(),
+            # --- 修正: 保存 img_encoder 的权重 ---
+            'img_encoder': self.img_encoder.state_dict(),
+            # --- 修正结束 ---
             'refine': self.refine_module.state_dict(),
             'opt': self.opt.state_dict(),
         }, save_path)
